@@ -61,6 +61,86 @@ class db_client(object):
 		cur = conn.cursor(DictCursor)
 		return conn,cur
 
+	def ensure_novel_table(self):
+		"""仅创建小说表，可安全重复执行。"""
+		from pathlib import Path
+		sql = (Path(__file__).parent / 'doc' / 'create_novel.sql').read_text(encoding='utf-8')
+		conn, cur = self.get_conn()
+		try:
+			cur.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=%s", ('novel',))
+			if cur.fetchone():
+				return
+			cur.execute(sql)
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		finally:
+			cur.close()
+			conn.close()
+
+	def ensure_novel_unavailable_table(self):
+		"""创建小说不可访问状态表，允许重复执行。"""
+		from pathlib import Path
+		sql = (Path(__file__).parent / 'doc' / 'create_novel_unavailable.sql').read_text(encoding='utf-8')
+		conn, cur = self.get_conn()
+		try:
+			cur.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=%s", ('novel_unavailable',))
+			if not cur.fetchone():
+				cur.execute(sql)
+				conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		finally:
+			cur.close()
+			conn.close()
+
+	def mark_novel_unavailable(self, nid, reason, status='deleted'):
+		"""记录小说明确不可访问状态，不触碰既有小说归档。"""
+		conn, cur = self.get_conn()
+		sql = (
+			"INSERT INTO novel_unavailable (nid,status,reason) VALUES (%s,%s,%s) "
+			"ON DUPLICATE KEY UPDATE status=%s,reason=%s,last_seen=CURRENT_TIMESTAMP"
+		)
+		try:
+			cur.execute(sql, (int(nid), status, str(reason), status, str(reason)))
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		finally:
+			cur.close()
+			conn.close()
+
+	def is_novel_unavailable(self, nid):
+		"""判断小说是否已有明确不可访问记录。"""
+		conn, cur = self.get_conn()
+		try:
+			cur.execute("SELECT 1 FROM novel_unavailable WHERE nid=%s LIMIT 1", (int(nid),))
+			return cur.fetchone() is not None
+		finally:
+			cur.close()
+			conn.close()
+
+	def upsert_novel(self, info):
+		fields = ('nid', 'uid', 'userName', 'purl', 'title', 'description', 'tag',
+			'createDate', 'updateDate', 'viewCount', 'bookmarkCount', 'is_r18', 'path')
+		sql = 'INSERT INTO novel ({}) VALUES ({}) ON DUPLICATE KEY UPDATE {}'.format(
+			','.join(fields), ','.join(['%s'] * len(fields)),
+			','.join('{}=%s'.format(field) for field in fields if field != 'nid'))
+		conn, cur = self.get_conn()
+		try:
+			cur.execute(sql, tuple(info[field] for field in fields) +
+				tuple(info[field] for field in fields if field != 'nid'))
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		finally:
+			cur.close()
+			conn.close()
+
 	def check_user(self, u):
 		"""
 		数据库中画师记录的latest_id与接口返回的latest_id是否一致
@@ -302,6 +382,19 @@ class db_client(object):
 		except Exception as e:
 			logger.warning(f"<Exception> - {e}")
 			return []
+		finally:
+			cur.close()
+			conn.close()
+
+	def select_latest_novels(self, limit=20):
+		"""获取小说表最近记录，避免复用插画字段查询。"""
+		conn, cur = self.get_conn()
+		try:
+			cur.execute("SELECT nid,path,title FROM novel ORDER BY id DESC LIMIT %s", (int(limit),))
+			return cur.fetchall() or []
+		except Exception as e:
+			logger.warning(f"<Exception> - {e}")
+			raise
 		finally:
 			cur.close()
 			conn.close()

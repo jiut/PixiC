@@ -8,6 +8,10 @@ ROOT_PATH = r''
 # 示例,D:\bookmark
 BOOKMARK_PATH = r''
 
+# 收藏小说路径为空时,在脚本当前路径创建novel文件夹
+# 小说与插画收藏使用独立目录
+NOVEL_PATH = r''
+
 # Chrome浏览器用户数据目录
 # 根据wiki进行更改,此为路径参考,一般只需要将<user>更改为你的用户名
 # PRO_DIR = r'C:\Users\Administrator\AppData\Local\Google\Chrome\User Data'
@@ -60,11 +64,16 @@ SKIP_ISEXISTS_ILLUST = True
 # 2. 适用于你信任数据库记录已经代表“已下载/已处理”的场景
 SKIP_DB_EXISTS_ILLUST = True
 
+# 小说数据库已有记录时跳过详情请求和 EPUB 重建
+SKIP_DB_EXISTS_NOVEL = True
+
 # 关注画师爬虫控制开关
 PIXIV_CRAWLER_ENABLED = False
 
 # 收藏作品爬虫控制开关
 PIXIV_BOOKMARK_ENABLED = True
+# 收藏小说爬虫控制开关
+PIXIV_NOVEL_ENABLED = False
 # 是否获取未公开收藏, 默认关闭
 # - USER_ID与pixiv_cookie为本人账号时,建议开启此项)
 # - USER_ID与pixiv_cookie非本人账号时,建议关闭此项)
@@ -85,6 +94,10 @@ USERS_LIMIT = 3000
 
 # 收藏-作品检测周期,单位秒,默认86400秒
 BOOKMARK_CYCLE = 86400
+
+# 小说收藏更新时检查最新作品数；本地一致性检查固定使用最近20部
+NOVEL_UPDATE_CHECK_LIMIT = 10
+NOVEL_INTEGRITY_CHECK_LIMIT = 20
 
 # 收藏-最低收藏限制,高于LIMIT才会下载,默认为0
 # 若只想要数据库记录,可设置为99999
@@ -133,3 +146,9 @@ ADAPTIVE_DELAY_MAX = 1.0           # 最大延迟（秒）
 ADAPTIVE_DELAY_INCREASE = 0.2      # 命中限流后的递增步长（秒）
 ADAPTIVE_DELAY_DECAY_RATIO = 0.5   # 成功请求后的衰减系数（0-1）
 # =======================================================
+
+
+# =============== 下载节奏（文件下载） ===============
+# 每个文件写入完成后的可选延时（秒），默认 0 表示不等待、无速度限制
+DOWNLOAD_POST_DELAY_SECONDS = 0
+# ====================================================

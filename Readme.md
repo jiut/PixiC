@@ -91,3 +91,28 @@ python scheduler.py
 
 + 希望可以提交`issue`和`pr`来帮助本项目进行完善，也欢迎`fork`和`star`本项目以对作者表示支持，感谢！
 + 本仓库仅用于学习与交流使用，因使用而产生的一切纠纷与原作者无关。
+# 收藏小说
+
+在 `v2.0/config.py` 中使用 `PIXIV_NOVEL_ENABLED` 开启小说收藏抓取，
+`NOVEL_PATH` 指定独立目录（空字符串使用运行目录下的 `novel`）。
+沿用账号 Cookie、`BOOKMARK_HIDE_ENABLE` 和 `BOOKMARK_CYCLE`。
+运行 `v2.0/scheduler.py` 会启动小说任务；在 `v2.0` 下运行 `python novel.py` 可单次抓取。
+
+每部小说保存为 `<NOVEL_PATH>/<小说ID>/<小说ID>.epub`，包含封面、作者上传的内嵌图片、
+引用的 Pixiv 插画（含多图页码），支持离线阅读、章节目录、分页和注音。
+同目录保留 UTF-8 TXT 原文及 `metadata.json` 完整信息。不自动扩展抓取整个系列。
+每轮遍历公开/私密收藏并检查更新，内容相同时不重复写文件；图片下载失败或引用图片不可访问时，
+保留旧 EPUB 并在下轮重试，不将缺图版本记为成功。
+每轮先校验数据库最近 20 部小说的 EPUB 文件并只输出汇总；随后只检查公开、私密收藏最新各 10 部。
+收藏未变化时跳过详情抓取和 EPUB 重建，检测到新收藏后才全量同步收藏列表。
+`SKIP_DB_EXISTS_NOVEL=True` 时，同步列表会跳过数据库已有小说并汇总数量；
+最近 20 部的一致性检查会验证 EPUB 清单、阅读顺序、XML、图片和本地引用，异常时尝试修复。
+
+启用 `DB_ENABLE` 后，小说任务自动创建独立的 `novel` 表和 `novel_unavailable` 不可访问状态表，并按 `nid` 更新元数据和 EPUB 文件路径。
+已有 TXT 记录将在下次成功抓取时自动更新为 EPUB 路径，无需修改表结构。
+文件全部保存成功才写入数据库，失败作品会在下一轮重试。关闭数据库也可保存小说。
+图片或小说遇到已删除、私密或无权限作品时，仅记录不可访问状态，不删除数据库历史记录或本地文件。
+已有数据库需要手动建表时，执行 `v2.0/doc/create_novel.sql` 和 `v2.0/doc/create_novel_unavailable.sql`（不要整体执行旧 `create.sql`，
+其中含历史查询和删除示例）。
+
+接口参考：[PixivBatchDownloader API.ts](https://github.com/xuejianxianzun/PixivBatchDownloader/blob/master/src/ts/API.ts)。

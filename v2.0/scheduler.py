@@ -3,7 +3,7 @@ import time
 from multiprocessing import Process
 
 from config import API_HOST,API_PORT,BOOKMARK_CYCLE,DB_ENABLE,USERS_CYCLE,\
-	PIXIV_BOOKMARK_ENABLED,PIXIV_CRAWLER_ENABLED,PIXIV_API_ENABLED
+	PIXIV_BOOKMARK_ENABLED,PIXIV_NOVEL_ENABLED,PIXIV_CRAWLER_ENABLED,PIXIV_API_ENABLED
 from login import client
 from log_record import logger
 from message import TEMP_MSG
@@ -37,6 +37,15 @@ class Scheduler(object):
 			b.run()
 			time.sleep(BOOKMARK_CYCLE)
 
+	def scheduler_novel(self, limit=BOOKMARK_CYCLE):
+		"""收藏小说"""
+		from novel import Novel
+		n = Novel()
+		while True:
+			n.run()
+			logger.info('{}，{} 秒后再次轮询', TEMP_MSG['SLEEP_INFO'].format('Novel'), limit)
+			time.sleep(limit)
+
 	def run(self):
 		logger.success(TEMP_MSG["VERSION_INFO"])
 		# client更新cookie
@@ -49,6 +58,10 @@ class Scheduler(object):
 		if PIXIV_BOOKMARK_ENABLED:
 			pixiv_bookmark = Process(target=self.scheduler_bookmark)
 			pixiv_bookmark.start()
+
+		if PIXIV_NOVEL_ENABLED:
+			pixiv_novel = Process(target=self.scheduler_novel)
+			pixiv_novel.start()
 
 		if PIXIV_API_ENABLED and DB_ENABLE:
 			pixiv_api = Process(target=self.scheduler_api)

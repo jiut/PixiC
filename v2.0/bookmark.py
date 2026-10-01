@@ -8,6 +8,7 @@ author: coder_sakura
 import json
 import time
 import random
+import threading
 
 from config import BOOKMARK_HIDE_ENABLE,SKIP_ISEXISTS_ILLUST,SKIP_DB_EXISTS_ILLUST,BOOKMARK_PATH
 from downer import Downloader
@@ -41,6 +42,20 @@ class Bookmark(object):
 		self.day_all_update_num = 5
 		self.day_limit = 800
 
+	def _count_run_stat(self, name):
+		stats = getattr(self, '_run_stats', None)
+		if stats is None:
+			return
+		with self._run_stats_lock:
+			stats[name] = stats.get(name, 0) + 1
+
+	def _log_run_summary(self):
+		stats = self._run_stats
+		logger.info("{}:本轮汇总，成功 {} 部，跳过已有 {} 部，跳过文件 {} 部，失败 {} 次，404/不可访问 {} 部，分页失败 {} 次{}",
+			self.class_name, stats["success"], stats["skipped_existing"],
+			stats["skipped_file"], stats["failed"], stats["deleted"],
+			stats["page_failed"], "，发生异常" if stats["aborted"] else "")
+
 	def get_page_bookmark(self, offset, rest="show", raw=False):
 		"""
 		根据offset和limit获取收藏插画的pid
@@ -59,7 +74,7 @@ class Bookmark(object):
 			r = json.loads(self.base_request({"url":self.bookmark_url},params=params).text)
 		except Exception as e:
 			# 网络请求出错
-			logger.warning(TEMP_MSG["BOOKMARK_PAGE_ERROR_INFO"].format(self.class_name,offset,offset+self.bookmark_page_offset))
+			logger.debug("{}: 分页请求异常 offset={}: {}", self.class_name, offset, e)
 			return None
 		else:
 			# 未登录
@@ -97,7 +112,7 @@ class Bookmark(object):
 			return False
 
 		# 公开收藏 - 错误
-		if res["error"]:
+		if not isinstance(res, dict) or res.get("error"):
 			logger.warning(TEMP_MSG["UPDATE_CHECK_ERROR_INFO"].format(self.class_name))
 			logger.warning(f"<res> - {res}")
 			return False
@@ -110,8 +125,8 @@ class Bookmark(object):
 		
 		if BOOKMARK_HIDE_ENABLE:
 			# 未公开收藏 - 错误/无权限
-			if res_hide["error"]:
-				if TEMP_MSG["NO_AUTH"] in res_hide["message"]:
+			if not isinstance(res_hide, dict) or res_hide.get("error"):
+				if isinstance(res_hide, dict) and TEMP_MSG["NO_AUTH"] in res_hide.get("message", ""):
 					logger.warning(TEMP_MSG["UPDATE_CHECK_NO_AUTH_INFO"].format(
 						self.class_name, self.user_id, self.user_id))
 				else:
@@ -143,6 +158,7 @@ class Bookmark(object):
 			try:
 				exists, _ = self.db.check_illust(pid, table="bookmark")
 				if exists:
+					self._count_run_stat('skipped_existing')
 					logger.info(f"SKIP_DB_EXISTS_ILLUST - {pid}")
 					return info
 			except Exception:
@@ -151,17 +167,20 @@ class Bookmark(object):
 		# 跳过已下载插画的请求
 		if SKIP_ISEXISTS_ILLUST and self.file_manager.search_isExistsPid(
 			BOOKMARK_PATH,"b",*(pid,)):
+			self._count_run_stat('skipped_file')
 			logger.info(f"SKIP_ISEXISTS_ILLUST - {pid}")
 			return info
 
 		try:
 			info = self.Downloader.get_illust_info(pid,extra="bookmark")
 		except Exception as e:
+			self._count_run_stat('failed')
 			logger.warning(TEMP_MSG["ILLUST_NETWORK_ERROR_INFO"].format(self.class_name,pid,e))
 			logger.warning(f"{pid} INFO:{info}")
 			return info
 
 		if not info: 
+			self._count_run_stat('failed')
 			logger.warning(TEMP_MSG["ILLUST_EMPTY_INFO"].format(self.class_name,pid))
 			return info
 
@@ -179,6 +198,7 @@ class Bookmark(object):
 
 		# 数据库开关关闭
 		if hasattr(self.db,"pool") == False:
+			self._count_run_stat('success')
 			return info
 
 		try:
@@ -187,33 +207,42 @@ class Bookmark(object):
 			if isExists == False:
 				# 第一次更新,pid不存在/被删除/无法找到
 				if info == TEMP_MSG["PID_DELETED_TEXT"] or info == TEMP_MSG["PID_ERROR_TEXT"]:
+					self._count_run_stat('deleted')
 					return info
 					
 				res = self.db.insert_illust(info,table="bookmark")
 				if res:
+					self._count_run_stat('success')
 					logger.success(TEMP_MSG["INSERT_SUCCESS_INFO"].format(self.class_name,pid))
 				else:
+					self._count_run_stat('failed')
 					logger.warning(TEMP_MSG["INSERT_FAIL_INFO"].format(self.class_name,pid))
 			# 数据库有该记录
 			else:
-				# pid不存在/已删除/已设为私密/无权限访问
+				# 远端不可访问时保留归档记录和本地文件，避免丢失历史元数据。
 				if info == TEMP_MSG["PID_DELETED_TEXT"] or\
 					info == TEMP_MSG["PID_UNAUTH_ACCESS"] or\
 					info == TEMP_MSG["PID_UNAUTH_ACCESS_2"]:
-					result = self.db.delete_user_illust(key="pid",value=pid,table="bookmark")
-					# 删除成功
-					if result:
-						logger.success(TEMP_MSG["DELELE_ILLUST_SUCCESS_INFO"].format(self.class_name,pid))
-					else:
-						logger.warning(TEMP_MSG["DELELE_ILLUST_FAIL_INFO"].format(self.class_name,pid))
+					logger.warning(f"{self.class_name}: 保留不可访问作品记录 - PID:{pid} - {info}")
+					self._count_run_stat('deleted')
+					return info
 				else:
 					self.db.update_illust(info,table="bookmark")
+					self._count_run_stat('success')
 		except Exception as e:
+			self._count_run_stat('failed')
 			logger.warning("thread_by_illust|Exception {}".format(e))
 			logger.warning(f"{pid} INFO:{info}")
 
 	@logger.catch
 	def run(self):
+		self._run_stats = {
+			"success": 0, "skipped_existing": 0, "skipped_file": 0,
+			"failed": 0, "deleted": 0, "page_failed": 0, "aborted": False,
+		}
+		self._run_stats_lock = threading.Lock()
+		run_stats = self._run_stats
+		pool = None
 		# 启动一致性检查（最近 20 条）
 		try:
 			run_startup_check(self.Downloader)
@@ -225,6 +254,7 @@ class Bookmark(object):
 		logger.info(TEMP_MSG["BEGIN_INFO"].format(self.class_name))
 		# 更新机制判定
 		if self.check_update() == False:
+			self._log_run_summary()
 			logger.info(TEMP_MSG["SLEEP_INFO"].format(self.class_name))
 			return
 
@@ -244,11 +274,12 @@ class Bookmark(object):
 					pid_list = self.get_page_bookmark(offset, rest)
 					# 获取异常返回None
 					if pid_list == None:
+						run_stats["page_failed"] += 1
 						logger.warning(TEMP_MSG["BOOKMARK_PAGE_ERROR_INFO"].format(
 							self.class_name, self.rest_dict[rest],
 							offset, offset+self.bookmark_page_offset
 						))
-						continue
+						break
 					
 					# 未登录
 					if pid_list == TEMP_MSG["UL_TEXT"]:
@@ -269,6 +300,7 @@ class Bookmark(object):
 					offset += self.bookmark_page_offset
 					# 取消固定/随机等待，统一交由 Downloader 自适应限速（仅对线上接口生效）
 		except Exception as e:
+			run_stats["aborted"] = True
 			logger.warning("Exception {}".format(e))
 		finally:
 			# 累计等于5次,不触发更新限制机制,全更新完后恢复day_count
@@ -278,10 +310,12 @@ class Bookmark(object):
 			else:
 				self.day_count += 1
 
-			pool.close()
+			if pool is not None:
+				pool.close()
 			# TDOD TAG COUNT完成工作
 			TAG_FLAG_BOOKMARK = True
 		logger.info("="*48)
+		self._log_run_summary()
 		logger.info(TEMP_MSG["SLEEP_INFO"].format(self.class_name))
 
 

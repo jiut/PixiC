@@ -12,6 +12,8 @@ import random
 import imageio
 import zipfile
 import requests
+import re
+from urllib.parse import urlsplit
 from urllib3.exceptions import InsecureRequestWarning
 import urllib3
 # 强制取消警告
@@ -123,6 +125,9 @@ class Downloader:
 				)
 			# 非 200 情况处理
 			if getattr(response, "status_code", 0) != 200:
+				# 小说详情 404 交给小说模块记录一次，不打印通用请求失败。
+				if response.status_code == 404 and re.fullmatch(r'/ajax/novel/\d+/?', urlsplit(_url).path):
+					return response
 				# 若是信息接口 404，多半为作品被删除/私密，返回可解析的错误 JSON，避免误判为网络失败
 				if response.status_code == 404 and any(key in _url for key in ["/ajax/illust/", "/touch/ajax/illust/details"]):
 					class _FakeResponse:

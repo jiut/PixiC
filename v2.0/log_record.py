@@ -15,6 +15,9 @@ from config import DEBUG
 import threading
 import re
 import atexit
+# 终端模式下各进程都启用跳过日志聚合；重定向到文件/管道时保留完整日志行。
+# 进程间的聚合计数彼此独立，但仍可避免同一抓取进程刷屏。
+_dynamic_console = sys.stderr.isatty()
 
 if DEBUG:
     level = "DEBUG"
@@ -79,6 +82,14 @@ def _is_skip_db_message(record):
         return False
 
 
+def _is_skip_novel_message(record):
+    try:
+        msg = record.get("message", "")
+        return isinstance(msg, str) and msg.startswith("SKIP_DB_EXISTS_NOVEL")
+    except Exception:
+        return False
+
+
 def _clear_agg_line():
     if _agg_state["active"]:
         _erase_line()
@@ -92,7 +103,8 @@ def _general_console_sink(message: str):
     # 在输出其他日志前，若存在单行聚合状态，则先清除该行
     with _agg_lock:
         _clear_agg_line()
-    sys.stderr.write(message)
+        sys.stderr.write(message)
+        sys.stderr.flush()
 
 
 def _agg_write(category: str, message: str):
@@ -127,8 +139,9 @@ def _bookmark_now_console_sink(message: str):
 logger.add(
     _general_console_sink,
     level=level,
-    filter=lambda record: not (
-        _is_skip_message(record) or _is_bookmark_now_message(record) or _is_skip_db_message(record)
+    filter=lambda record: not _dynamic_console or not (
+        _is_skip_message(record) or _is_bookmark_now_message(record) or
+        _is_skip_db_message(record) or _is_skip_novel_message(record)
     ),
     colorize=True
 )
@@ -137,7 +150,7 @@ logger.add(
 logger.add(
     _skip_console_sink,
     level=level,
-    filter=lambda record: _is_skip_message(record),
+    filter=lambda record: _dynamic_console and _is_skip_message(record),
     format="<level>{message}</level>",
     colorize=True
 )
@@ -146,7 +159,7 @@ logger.add(
 logger.add(
     _bookmark_now_console_sink,
     level=level,
-    filter=lambda record: _is_bookmark_now_message(record),
+    filter=lambda record: _dynamic_console and _is_bookmark_now_message(record),
     format="<level>{message}</level>",
     colorize=True
 )
@@ -159,7 +172,20 @@ def _skip_db_console_sink(message: str):
 logger.add(
     _skip_db_console_sink,
     level=level,
-    filter=lambda record: _is_skip_db_message(record),
+    filter=lambda record: _dynamic_console and _is_skip_db_message(record),
+    format="<level>{message}</level>",
+    colorize=True
+)
+
+
+def _skip_novel_console_sink(message: str):
+    _agg_write("skip_db_exists_novel", message)
+
+
+logger.add(
+    _skip_novel_console_sink,
+    level=level,
+    filter=lambda record: _dynamic_console and _is_skip_novel_message(record),
     format="<level>{message}</level>",
     colorize=True
 )

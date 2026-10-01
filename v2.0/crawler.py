@@ -237,16 +237,12 @@ class Crawler(object):
 					logger.warning(TEMP_MSG["INSERT_FAIL_INFO"].format(self.class_name,pid))
 			# 数据库有该记录
 			else:
-				# pid不存在/已删除/已设为私密/无权限访问
+				# 远端不可访问时保留归档记录和本地文件，避免丢失历史元数据。
 				if info == TEMP_MSG["PID_DELETED_TEXT"] or\
 					info == TEMP_MSG["PID_UNAUTH_ACCESS"] or\
 					info == TEMP_MSG["PID_UNAUTH_ACCESS_2"]:
-					result = self.db.delete_user_illust(key="pid",value=pid)
-					# 删除成功
-					if result:
-						logger.success(TEMP_MSG["DELELE_ILLUST_SUCCESS_INFO"].format(self.class_name,pid))
-					else:
-						logger.warning(TEMP_MSG["DELELE_ILLUST_FAIL_INFO"].format(self.class_name,pid))
+					logger.warning(f"{self.class_name}: 保留不可访问作品记录 - PID:{pid} - {info}")
+					return info
 				else:
 					self.db.update_illust(info)
 		except Exception as e:
