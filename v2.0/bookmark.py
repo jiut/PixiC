@@ -19,6 +19,7 @@ from ptimer import Timer
 # TODO
 from tag import TAG_FLAG_BOOKMARK
 from checker import run_startup_check
+from phase_result import PhaseResult
 
 
 class Bookmark(object):
@@ -56,6 +57,11 @@ class Bookmark(object):
 			stats["skipped_file"], stats["failed"], stats["deleted"],
 			stats["page_failed"], "，发生异常" if stats["aborted"] else "")
 
+	def _task_callback(self, status, _result):
+		"""线程池任务异常的统一统计回调。"""
+		if not status:
+			self._count_run_stat('failed')
+
 	def get_page_bookmark(self, offset, rest="show", raw=False):
 		"""
 		根据offset和limit获取收藏插画的pid
@@ -88,63 +94,36 @@ class Bookmark(object):
 			return illusts_pid
 
 	def check_update(self):
-		"""
-		检查是否更新,获取收藏第一页前十个插画的id
-		更新机制:
-			获取最新收藏的10条插画id,与数据库中的记录进行比对
-			若最新收藏的10条插画id有一条在数据库中,则跳过;若不在则更新
-			实际上是以最快10分钟内收藏10条新作品这个标准作为界限
-		"""
-
-		# 数据库开关若关闭,直接更新
-		if hasattr(self.db,"pool") == False:
+		"""Return changed, unchanged or error after checking every enabled list."""
+		if hasattr(self.db, "pool") is False:
 			logger.warning(TEMP_MSG["UPDATE_INFO"].format(self.class_name))
-			return True
-
-		# 判断非公开及公开
-		res = self.get_page_bookmark(offset=0, raw=True)
-		if BOOKMARK_HIDE_ENABLE:
-			res_hide = self.get_page_bookmark(offset=0, rest="hide", raw=True)
-
-		# 未登录
-		if res == TEMP_MSG["UL_TEXT"]:
-			logger.warning(TEMP_MSG["UPDATE_CHECK_ERROR_INFO"].format(self.class_name))
-			return False
-
-		# 公开收藏 - 错误
-		if not isinstance(res, dict) or res.get("error"):
-			logger.warning(TEMP_MSG["UPDATE_CHECK_ERROR_INFO"].format(self.class_name))
-			logger.warning(f"<res> - {res}")
-			return False
-
-		# 验证前十张
-		for _ in res["body"]["works"][:10]:
-			if not self.db.check_illust(int(_["id"]),table="bookmark")[0]:
-				logger.success(TEMP_MSG["UPDATE_INFO"].format(self.class_name))
-				return True
-		
-		if BOOKMARK_HIDE_ENABLE:
-			# 未公开收藏 - 错误/无权限
-			if not isinstance(res_hide, dict) or res_hide.get("error"):
-				if isinstance(res_hide, dict) and TEMP_MSG["NO_AUTH"] in res_hide.get("message", ""):
-					logger.warning(TEMP_MSG["UPDATE_CHECK_NO_AUTH_INFO"].format(
-						self.class_name, self.user_id, self.user_id))
-				else:
-					logger.warning(TEMP_MSG["UPDATE_CHECK_ERROR_INFO"].format(self.class_name))
-				logger.warning(f"<res_hide> - {res_hide}")
-				return False
-			# 作品为空
-			if not res["body"]["works"] and not res_hide["body"]["works"]:
-				logger.warning(TEMP_MSG["UPDATE_CHECK_EMPTY_INFO"].format(self.class_name))
-				return False
-			# 验证前十张
-			for _ in res_hide["body"]["works"][:10]:
-				if not self.db.check_illust(int(_["id"]),table="bookmark")[0]:
+			return "changed"
+		responses = []
+		for rest in self.rest_list:
+			response = self.get_page_bookmark(offset=0, rest=rest, raw=True)
+			if response == TEMP_MSG["UL_TEXT"] or not isinstance(response, dict) or response.get("error"):
+				logger.warning(TEMP_MSG["UPDATE_CHECK_ERROR_INFO"].format(self.class_name))
+				return "error"
+			responses.append(response)
+		for response in responses:
+			works = response.get("body", {}).get("works", [])
+			if not isinstance(works, list):
+				return "error"
+			for work in works[:10]:
+				try:
+					exists, _ = self.db.check_illust(int(work["id"]), table="bookmark", strict=True)
+				except TypeError:
+					exists, _ = self.db.check_illust(int(work["id"]), table="bookmark")
+				except Exception:
+					return "error"
+				if not exists:
 					logger.success(TEMP_MSG["UPDATE_INFO"].format(self.class_name))
-					return True
-		
-		logger.warning(TEMP_MSG["UPDATE_CANLE_INFO"].format(self.class_name))
-		return False
+					return "changed"
+		if all(not response.get("body", {}).get("works", []) for response in responses):
+			logger.warning(TEMP_MSG["UPDATE_CHECK_EMPTY_INFO"].format(self.class_name))
+		else:
+			logger.warning(TEMP_MSG["UPDATE_CANLE_INFO"].format(self.class_name))
+		return "unchanged"
 
 	def thread_by_illust(self, *args):
 		"""
@@ -191,10 +170,18 @@ class Bookmark(object):
 			timer.pid = pid
 			timer.extra = "bookmark"
 			try:
-				info = timer.waiting(info)
+				info = timer.waiting(info, stop_event=getattr(self, "_stop_event", None))
 			except Exception as e:
 				logger.warning(f"Exception - {e} - {info}")
 			logger.success(f"共休眠{timer._time}秒,重新恢复访问")
+
+		# 远端不可访问结果不作为成功元数据；保留已有归档。
+		if info == TEMP_MSG["PID_DELETED_TEXT"] or info == TEMP_MSG["PID_UNAUTH_ACCESS"] or info == TEMP_MSG["PID_UNAUTH_ACCESS_2"]:
+			self._count_run_stat('deleted')
+			return info
+		if isinstance(info, str):
+			self._count_run_stat('failed')
+			return info
 
 		# 数据库开关关闭
 		if hasattr(self.db,"pool") == False:
@@ -227,15 +214,19 @@ class Bookmark(object):
 					self._count_run_stat('deleted')
 					return info
 				else:
-					self.db.update_illust(info,table="bookmark")
+					if not self.db.update_illust(info,table="bookmark"):
+						raise RuntimeError("更新图片数据库记录失败")
 					self._count_run_stat('success')
 		except Exception as e:
 			self._count_run_stat('failed')
 			logger.warning("thread_by_illust|Exception {}".format(e))
 			logger.warning(f"{pid} INFO:{info}")
 
-	@logger.catch
-	def run(self):
+	def run_once(self, stop_event=None, deadline=None):
+		if stop_event is None:
+			stop_event = threading.Event()
+		self._stop_event = stop_event
+		self.Downloader.stop_event = stop_event
 		self._run_stats = {
 			"success": 0, "skipped_existing": 0, "skipped_file": 0,
 			"failed": 0, "deleted": 0, "page_failed": 0, "aborted": False,
@@ -243,34 +234,50 @@ class Bookmark(object):
 		self._run_stats_lock = threading.Lock()
 		run_stats = self._run_stats
 		pool = None
+		result = PhaseResult(self.class_name.lower())
 		# 启动一致性检查（最近 20 条）
 		try:
-			run_startup_check(self.Downloader)
+			check_stats = run_startup_check(self.Downloader) or {}
+			for key in ("failed", "query_failed"):
+				if check_stats.get(key):
+					result.add_error("图片一致性检查{} {} 条".format(key, check_stats[key]))
 		except Exception as e:
+			check_stats = {"error": 1}
+			result.add_error("图片一致性检查异常: {}".format(e))
 			logger.warning(f"启动一致性检查失败: {e}")
 
 		# TDOD TAG COUNT开始工作
 		TAG_FLAG_BOOKMARK = False
 		logger.info(TEMP_MSG["BEGIN_INFO"].format(self.class_name))
 		# 更新机制判定
-		if self.check_update() == False:
+		update_state = self.check_update()
+		if update_state in (False, 'unchanged'):
+			result.unchanged = True
 			self._log_run_summary()
-			logger.info(TEMP_MSG["SLEEP_INFO"].format(self.class_name))
-			return
+			result.barrier_passed = True
+			result.cleanup_complete = True
+			result.counts.update(self._run_stats)
+			return result
+		if update_state in (None, 'error'):
+			result.add_error("收藏更新检查失败")
+			logger.warning("{}: 收藏更新检查失败，跳过图片分页但继续完成阶段边界".format(self.class_name))
+			result.counts.update(self._run_stats)
+			result.barrier_passed = True
+			result.cleanup_complete = True
+			return result
 
 		try:
 			offset = 0
 			pool = ThreadPool(8)
 			# 分别获取公开/非公开收藏插画
 			for rest in self.rest_list:
+				if stop_event.is_set():
+					break
 				logger.info(f"===== 开始获取{self.rest_dict[rest]}收藏 =====")
+				offset = 0
 				while True:
-					# 累计更新小于5次,更新前800张(实际为768) TODO
-					if self.day_count < self.day_all_update_num:
-						if offset > self.day_limit:
-							logger.info(TEMP_MSG["UPDATE_DAY_LIMIT_INFO"].format(self.class_name,self.day_limit,self.day_count))
-							break
-
+					if stop_event.is_set() or (deadline is not None and time.monotonic() >= deadline):
+						break
 					pid_list = self.get_page_bookmark(offset, rest)
 					# 获取异常返回None
 					if pid_list == None:
@@ -295,7 +302,8 @@ class Bookmark(object):
 
 					logger.info(TEMP_MSG["BOOKMARK_NOW_INFO"].format(offset,offset+self.bookmark_page_offset,len(pid_list)))
 					for pid in pid_list:
-						pool.put(self.thread_by_illust,(pid,),callback)
+						if not pool.put(self.thread_by_illust, (pid,), self._task_callback, stop_event=stop_event, deadline=deadline):
+							self._count_run_stat('failed')
 
 					offset += self.bookmark_page_offset
 					# 取消固定/随机等待，统一交由 Downloader 自适应限速（仅对线上接口生效）
@@ -312,11 +320,35 @@ class Bookmark(object):
 
 			if pool is not None:
 				pool.close()
+				joined = pool.join(stop_event=stop_event, deadline=deadline)
+				for kind, error in pool.errors:
+					result.add_error("线程池{}异常: {}".format(kind, error))
+				if not joined:
+					run_stats["aborted"] = True
+					result.reason = "线程池未在阶段预算内收尾"
+					# 非 daemon worker 不能遗留到 IMAGE_PHASE_DONE 之后；预算失败
+					# 只影响阶段结果，仍等待正在执行的请求安全结束。
+					pool.join()
 			# TDOD TAG COUNT完成工作
 			TAG_FLAG_BOOKMARK = True
 		logger.info("="*48)
 		self._log_run_summary()
-		logger.info(TEMP_MSG["SLEEP_INFO"].format(self.class_name))
+		result.counts.update(run_stats)
+		result.errors.extend(["图片任务失败 {} 次".format(run_stats["failed"])] if run_stats["failed"] else [])
+		result.errors.extend(["分页失败 {} 次".format(run_stats["page_failed"])] if run_stats["page_failed"] else [])
+		if stop_event.is_set():
+			result.status = "stopped"
+			result.barrier_passed = False
+		elif result.reason or run_stats["aborted"]:
+			result.status = "failed"
+			result.barrier_passed = False
+		else:
+			result.barrier_passed = True
+		result.cleanup_complete = True
+		return result
+
+	def run(self):
+		return self.run_once()
 
 
 # if __name__ == '__main__':

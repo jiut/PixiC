@@ -2,20 +2,20 @@
 # ================================================
 # 关注画师路径为空时,在脚本当前路径创建pixiv_crawler文件夹
 # 示例,D:\author
-ROOT_PATH = r''
+ROOT_PATH = r'E:\BaiduNetdiskDownload\pixic\follow'
 
 # 收藏作品路径为空时,在脚本当前路径创建bookmark文件夹
 # 示例,D:\bookmark
-BOOKMARK_PATH = r''
+BOOKMARK_PATH = r'E:\BaiduNetdiskDownload\pixic'
 
 # 收藏小说路径为空时,在脚本当前路径创建novel文件夹
 # 小说与插画收藏使用独立目录
-NOVEL_PATH = r''
+NOVEL_PATH = r'E:\BaiduNetdiskDownload\pixic\novel'
 
 # Chrome浏览器用户数据目录
 # 根据wiki进行更改,此为路径参考,一般只需要将<user>更改为你的用户名
 # PRO_DIR = r'C:\Users\Administrator\AppData\Local\Google\Chrome\User Data'
-PRO_DIR = r''
+PRO_DIR = r'D:\selenium\chrome_temp'
 # ================================================
 
 
@@ -23,7 +23,7 @@ PRO_DIR = r''
 # USER_ID,即uid.用于获取对应用户的关注, 收藏作品.
 # 1.一般是填写自己的账号下载关注画师作品和收藏插画
 # 2.填写他人的uid时并选择其他目录作为下载目录, 避免下载混乱
-USER_ID = ""
+USER_ID = "15723512"
 
 
 """
@@ -33,8 +33,8 @@ USER_ID = ""
 3. 若不想配置Chrome,可将此项设置为False,
 然后进行自定义cookie的配置(ORIGI_COOKIE_LIST)
 """
-COOKIE_UPDATE_ENABLED = True
-# COOKIE_UPDATE_ENABLED = False
+# COOKIE_UPDATE_ENABLED = True
+COOKIE_UPDATE_ENABLED = False
 
 
 """
@@ -73,11 +73,11 @@ PIXIV_CRAWLER_ENABLED = False
 # 收藏作品爬虫控制开关
 PIXIV_BOOKMARK_ENABLED = True
 # 收藏小说爬虫控制开关
-PIXIV_NOVEL_ENABLED = False
+PIXIV_NOVEL_ENABLED = True
 # 是否获取未公开收藏, 默认关闭
 # - USER_ID与pixiv_cookie为本人账号时,建议开启此项)
 # - USER_ID与pixiv_cookie非本人账号时,建议关闭此项)
-BOOKMARK_HIDE_ENABLE = False
+BOOKMARK_HIDE_ENABLE = True
 
 # API控制开关
 PIXIV_API_ENABLED = False
@@ -95,6 +95,10 @@ USERS_LIMIT = 3000
 # 收藏-作品检测周期,单位秒,默认86400秒
 BOOKMARK_CYCLE = 86400
 
+# 单次批次中每个阶段允许使用的最长协作预算（秒）。
+# 外部计划器负责批次间隔；设置为 None 可关闭阶段预算。
+BATCH_PHASE_DEADLINE_SECONDS = 86400
+
 # 小说收藏更新时检查最新作品数；本地一致性检查固定使用最近20部
 NOVEL_UPDATE_CHECK_LIMIT = 10
 NOVEL_INTEGRITY_CHECK_LIMIT = 20
@@ -106,7 +110,7 @@ BOOKMARK_LIMIT = 0
 
 
 # ================== API设置 =======================
-API_HOST = '0.0.0.0'
+API_HOST = '127.0.0.1'
 # 2020/5/10 pixiv网站排名 + 5
 API_PORT = '1526'
 # API数据库线程数
@@ -121,13 +125,13 @@ RANDOM_LIMIT = 10
 # True - 数据入库
 # False - 不使用数据库, 同时API也无法使用
 # DB_ENABLE = True
-DB_ENABLE = False
+DB_ENABLE = True
 
 # create.sql在doc目录下
 DB_HOST = 'localhost'
 DB_PORT = 3306
-DB_USER = 'pixiv'
-DB_PASSWD = 'Huawei12#$'
+DB_USER = 'root'
+DB_PASSWD = '145132'
 DB_DATABASE = 'moe'
 DB_CHARSET = "utf8mb4"
 # ================================================

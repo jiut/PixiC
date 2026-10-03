@@ -1,207 +1,246 @@
 # coding=utf8
+"""Small cooperative thread pool used by the legacy crawlers."""
 
-"""
-一个基于thread和queue的线程池,
-任务为队列元素,动态创建线程并重复利用.
-通过close和terminate关闭线程池.
-"""
-
+import contextlib
 import queue
 import threading
-import contextlib
 import time
 
-# 创建空对象,用于停止线程
+
 StopEvent = object()
 
 
 def callback(status, result):
-    """
-    根据需要进行的回调函数，默认不执行。
-    :param status: action函数的执行状态
-    :param result: action函数的返回值
-    :return:
-    """
-    pass
+    """Backward-compatible no-op callback."""
+    return None
 
 
 def action(thread_name, arg):
-    """
-    真实的任务定义在这个函数里
-    :param thread_name: 执行该方法的线程名
-    :param arg: 该函数需要的参数
-    :return:
-    """
-    # 模拟执行
     time.sleep(0.1)
-    print("第%s个任务调用了线程 %s，并打印了这条信息！" % (arg+1, thread_name))
+    print("第%s个任务调用了线程 %s，并打印了这条信息！" % (arg + 1, thread_name))
 
 
 class ThreadPool:
-
     def __init__(self, max_num, max_task_num=None):
-        """
-        初始化线程池
-        :param max_num: 线程池最大线程数量
-        :param max_task_num: 任务队列长度
-        """
-        # 如果提供了最大任务数的参数，则将队列的最大元素个数设置为这个值。
-        max_task_num = 20
-        if max_task_num:
-            self.q = queue.Queue(max_task_num)
-        # 默认队列可接受无限多个的任务
-        else:
-            self.q = queue.Queue()
-        # print("创建好队列了")
-        # 设置线程池最多可实例化的线程数
-        self.max_num = max_num
-        # 任务取消标识
+        self.max_num = max(1, int(max_num))
+        if max_task_num is not None and max_task_num < 0:
+            raise ValueError("max_task_num must be non-negative")
+        self.q = queue.Queue(maxsize=max_task_num or 0)
         self.cancel = False
-        # 任务中断标识
         self.terminal = False
-        # 已实例化的线程列表
+        self._closed = False
+        self._lock = threading.RLock()
+        self._threads = []
+        self._active = 0
+        self._completed = 0
+        self._cancelled = 0
+        self._errors = []
+        # Kept for callers that inspect the old pool state.
         self.generate_list = []
-        # 处于空闲状态的线程列表
         self.free_list = []
 
-    def put(self, func, args, callback=None):
+    @property
+    def errors(self):
+        with self._lock:
+            return list(self._errors)
+
+    @property
+    def stats(self):
+        with self._lock:
+            return {
+                "completed": self._completed,
+                "cancelled": self._cancelled,
+                "active": self._active,
+                "queued": self.q.qsize(),
+                "errors": len(self._errors),
+            }
+
+    def _ensure_worker(self):
+        with self._lock:
+            live = [thread for thread in self._threads if thread.is_alive()]
+            self._threads = live
+            if len(live) >= self.max_num:
+                return
+            thread = threading.Thread(target=self.call)
+            thread.daemon = False
+            self._threads.append(thread)
+            self.generate_list.append(thread.name)
+            thread.start()
+
+    def put(self, func, args, callback=None, stop_event=None, deadline=None):
+        """Queue one task, returning ``False`` when it was not accepted.
+
+        The first three arguments preserve the crawler API.  The optional
+        cooperative controls only affect this submission and do not require
+        changing legacy task callables.
         """
-        往任务队列里放入一个任务
-        :param func: 任务函数
-        :param args: 任务函数所需参数
-        :param callback: 任务执行失败或成功后执行的回调函数，回调函数有两个参数
-        1、任务函数执行状态；2、任务函数返回值（默认为None，即：不执行回调函数）
-        :return: 如果线程池已经终止，则返回True否则None
-        """
-        # 先判断标识，看看任务是否取消了
-        if self.cancel:
-            return
-        # 如果没有空闲的线程，并且已创建的线程的数量小于预定义的最大线程数，则创建新线程。
-        if len(self.free_list) == 0 and len(self.generate_list) < self.max_num:
-            self.generate_thread()
-        # 构造任务参数元组，分别是调用的函数，该函数的参数，回调函数。
-        w = (func, args, callback,)
-        # 将任务放入队列
-        self.q.put(w)
+        with self._lock:
+            if self.cancel or self._closed:
+                self._cancelled += 1
+                return False
+        if stop_event is not None and stop_event.is_set():
+            with self._lock:
+                self._cancelled += 1
+            return False
+        if deadline is not None and time.monotonic() >= deadline:
+            with self._lock:
+                self._cancelled += 1
+            return False
+        self._ensure_worker()
+        item = (func, tuple(args or ()), callback, stop_event, deadline)
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                with self._lock:
+                    self._cancelled += 1
+                return False
+            if deadline is not None and time.monotonic() >= deadline:
+                with self._lock:
+                    self._cancelled += 1
+                return False
+            try:
+                self.q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                with self._lock:
+                    if self.cancel or self._closed:
+                        self._cancelled += 1
+                        return False
 
     def generate_thread(self):
-        """
-        创建一个线程
-        """
-        # 每个线程都执行call方法
-        t = threading.Thread(target=self.call)
-        t.start()
+        self._ensure_worker()
+
+    def _record_error(self, kind, exc):
+        with self._lock:
+            self._errors.append((kind, exc))
 
     def call(self):
-        """
-        循环去获取任务函数并执行任务函数。在正常情况下，每个线程都保存生存状态,直到获取线程终止的flag。
-        """
-        # 获取当前线程的名字
-        current_thread = threading.currentThread().getName()
-        # 将当前线程的名字加入已实例化的线程列表中
-        self.generate_list.append(current_thread)
-        # 从任务队列中获取一个任务
-        event = self.q.get()
-        # 让获取的任务不是终止线程的标识对象时
-        while event != StopEvent:
-            # 解析任务中封装的三个参数
-            func, arguments, callback = event
-            # 抓取异常，防止线程因为异常退出
-            try:
-                # 正常执行任务函数
-                result = func(*arguments)
-                # result = func(current_thread, *arguments)
-                success = True
-            except Exception as e:
-                # 当任务执行过程中弹出异常
-                result = None
-                success = False
-            # 如果有指定的回调函数
-            if callback is not None:
-                # 执行回调函数，并抓取异常
+        current = threading.current_thread().name
+        with self.worker_state(self.free_list, current):
+            while True:
                 try:
-                    callback(success, result)
-                except Exception as e:
-                    pass
-            # 当某个线程正常执行完一个任务时，先执行worker_state方法
-            with self.worker_state(self.free_list, current_thread):
-                # 如果强制关闭线程的flag开启，则传入一个StopEvent元素
-                if self.terminal:
-                    event = StopEvent
-                # 否则获取一个正常的任务，并回调worker_state方法的yield语句
-                else:
-                    # 从这里开始又是一个正常的任务循环
-                    event = self.q.get()
-        else:
-            # 一旦发现任务是个终止线程的标识元素，将线程从已创建线程列表中删除
-            self.generate_list.remove(current_thread)
+                    event = self.q.get(timeout=0.1)
+                except queue.Empty:
+                    with self._lock:
+                        should_exit = self._closed or self.terminal
+                    if should_exit:
+                        break
+                    continue
+                if event is StopEvent:
+                    self.q.task_done()
+                    break
+                func, arguments, cb, stop_event, deadline = event
+                with self._lock:
+                    self._active += 1
+                success = False
+                result = None
+                try:
+                    cancelled = self.terminal or (stop_event is not None and stop_event.is_set())
+                    if deadline is not None and time.monotonic() >= deadline:
+                        cancelled = True
+                    if cancelled:
+                        with self._lock:
+                            self._cancelled += 1
+                    else:
+                        result = func(*arguments)
+                        success = True
+                except Exception as exc:
+                    self._record_error("task", exc)
+                finally:
+                    if cb is not None:
+                        try:
+                            cb(success, result)
+                        except Exception as exc:
+                            self._record_error("callback", exc)
+                    with self._lock:
+                        self._active -= 1
+                        self._completed += 1
+                    self.q.task_done()
+            with self._lock:
+                if current in self.generate_list:
+                    self.generate_list.remove(current)
 
     def close(self):
+        """Stop accepting new work and let queued work drain.
+
+        Closing is deliberately non-blocking for compatibility with the
+        original crawler.  Callers that need a phase boundary must call
+        :meth:`join` afterwards.
         """
-        执行完所有的任务后，让所有线程都停止的方法
-        """
-        # 设置flag
-        self.cancel = True
-        # 计算已创建线程列表中线程的个数，
-        # 然后往任务队列里推送相同数量的终止线程的标识元素
-        full_size = len(self.generate_list)
-        while full_size:
-            self.q.put(StopEvent)
-            full_size -= 1
+        with self._lock:
+            self.cancel = True
+            self._closed = True
 
     def terminate(self):
-        """
-        在任务执行过程中，终止线程，提前退出。
-        """
-        self.terminal = True
-        # 强制性的停止线程
-        while self.generate_list:
-            self.q.put(StopEvent)
+        """Cooperatively cancel queued work and stop workers after active work."""
+        with self._lock:
+            self.terminal = True
+            self.cancel = True
+            self._closed = True
+        self._cancel_queued(invoke_callbacks=True)
 
-    # 该装饰器用于上下文管理
+    def join(self, stop_event=None, deadline=None):
+        """Wait until queued work and all real worker threads have finished.
+
+        A deadline only bounds this waiter's observation.  Returning ``False``
+        never claims that workers disappeared; callers must keep the phase
+        closed and must not cross a completion barrier while a thread remains.
+        """
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                self.terminate()
+            with self._lock:
+                threads = list(self._threads)
+                done = self.q.unfinished_tasks == 0 and self._active == 0
+            if done and not any(thread.is_alive() for thread in threads):
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                # Do not claim a barrier while an uncooperative task remains.
+                return False
+            current = threading.current_thread()
+            wait_for = 0.05
+            if deadline is not None:
+                wait_for = max(0.0, min(wait_for, deadline - time.monotonic()))
+            for thread in threads:
+                if thread is current or not thread.is_alive():
+                    continue
+                thread.join(timeout=wait_for)
+            if not threads:
+                time.sleep(wait_for)
+
+    def _cancel_queued(self, invoke_callbacks=False):
+        while True:
+            try:
+                event = self.q.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                with self._lock:
+                    self._cancelled += 1
+                    self._completed += 1
+                if invoke_callbacks and event is not StopEvent:
+                    _, _, cb, _, _ = event
+                    if cb is not None:
+                        try:
+                            cb(False, None)
+                        except Exception as exc:
+                            self._record_error("callback", exc)
+                self.q.task_done()
+
     @contextlib.contextmanager
     def worker_state(self, state_list, worker_thread):
-        """
-        用于记录空闲的线程，或从空闲列表中取出线程处理任务
-        """
-        # 将当前线程，添加到空闲线程列表中
-        state_list.append(worker_thread)
-        # 捕获异常
+        with self._lock:
+            state_list.append(worker_thread)
         try:
-            # 在此等待
             yield
         finally:
-            # 将线程从空闲列表中移除
-            state_list.remove(worker_thread)
+            with self._lock:
+                if worker_thread in state_list:
+                    state_list.remove(worker_thread)
 
-"""
 
-# 调用方式
-if __name__ == '__main__':
-    # 创建一个最多包含5个线程的线程池
-    # pool = ThreadPool(5)
-
-    # 创建100个任务，让线程池进行处理
-    # for i in range(100):
-    #     pool.put(action, (i,), callback)
-    
-    # 等待一定时间，让线程执行任务
-    # time.sleep(3)
-
-    print("-" * 50)
-    while True:
-        print("\033[32;0m任务停止之前线程池中有%s个线程，空闲的线程有%s个！\033[0m"
-              % (len(pool.generate_list), len(pool.free_list)))
-
-        if len(pool.free_list) == pool.max_num and len(pool.generate_list) == 5:
-            # 正常关闭线程池
-            pool.close()
-            print("任务执行完毕，正常退出！")
-            break
-
-        time.sleep(1)
-    # 强制关闭线程池
-    # pool.terminate()
-    # print("强制停止任务！")
-
-"""
+if __name__ == "__main__":
+    pool = ThreadPool(5)
+    for index in range(100):
+        pool.put(action, (index,), callback)
+    pool.close()
+    pool.join()

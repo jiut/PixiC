@@ -13,6 +13,10 @@ from log_record import logger
 from message import TEMP_MSG
 
 
+class DatabaseInitializationError(RuntimeError):
+	"""数据库连接池初始化失败。"""
+
+
 class db_client(object):
 	"""
 	关注画师-数据库流程:
@@ -48,9 +52,9 @@ class db_client(object):
 				blocking=True,
 			    host=DB_HOST,user=DB_USER,passwd=DB_PASSWD,db=DB_DATABASE,port=DB_PORT,charset=DB_CHARSET
 			)
-		except pymysql.err.OperationalError as e:
+		except Exception as e:
 			logger.warning(TEMP_MSG["DB_CONNECT_ERROR_INFO"].format(e))
-			exit()
+			raise DatabaseInitializationError("数据库连接池初始化失败") from e
 
 	def get_conn(self):
 		"""
@@ -230,7 +234,7 @@ class db_client(object):
 			cur.close()
 			conn.close()
 
-	def check_illust(self, value, key="pid", table="pixiv", database=None):
+	def check_illust(self, value, key="pid", table="pixiv", database=None, strict=False):
 		"""
 		查询数据库中是否有该id的作品,table为非pixiv,bookmark时采用通用sql		
 		:parmas key: 对应字段名
@@ -241,12 +245,13 @@ class db_client(object):
 			data in db: [{'COUNT(1)': 1, 'path': 'None'}]
 			data not in db: ()
 		"""
-		conn,cur = self.get_conn()
 		if key == "":
 			return False,""
 
 		if value == "":
 			return False,""
+
+		conn,cur = self.get_conn()
 
 		# 切换数据库
 		if database != None:
@@ -259,11 +264,13 @@ class db_client(object):
 		else:
 			sql = """SELECT COUNT(1) FROM {} """.format(table) + """WHERE {}=%s""".format(key)
 		# logger.debug(sql)
-		data = (value)
+		data = (value,)
 		try:
 			cur.execute(sql,data)
 		except Exception as e:
 			logger.warning(f"Exception: {e} - {key}:{value}")
+			if strict:
+				raise
 			return False,""
 		else:
 			# 未使用GROUP BY path,非严格模式报1140
@@ -369,7 +376,7 @@ class db_client(object):
 			cur.close()
 			conn.close()
 
-	def select_latest_records(self, table="pixiv", limit=20):
+	def select_latest_records(self, table="pixiv", limit=20, strict=False):
 		"""
 		获取指定表按自增 id 倒序的最近 N 条记录，包含 pid/path/pageCount/illustType/uid/userName。
 		"""
@@ -381,6 +388,8 @@ class db_client(object):
 			return r or []
 		except Exception as e:
 			logger.warning(f"<Exception> - {e}")
+			if strict:
+				raise
 			return []
 		finally:
 			cur.close()

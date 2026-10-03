@@ -319,9 +319,11 @@ class Crawler(object):
 							logger.warning(TEMP_MSG["DELELE_USER_ILLUST_FAIL_INFO"].format(self.class_name,u["userName"],u["uid"]))
 		except Exception as e:
 			logger.warning("Exception:{}".format(e))
-			pool.close()
 		finally:
 			pool.close()
+			# close() stops new submissions; join() is the phase
+			# boundary that waits for every queued task/callback.
+			pool.join()
 			# 完成工作
 			TAG_FLAG_USER = True
 

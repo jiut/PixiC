@@ -13,9 +13,22 @@ from downer import Downloader
 from folder import file_manager
 from image_check import IsValidImage
 from log_record import logger
+from message import TEMP_MSG
 
 TABLES = ["pixiv", "bookmark"]
 LATEST_LIMIT = 20
+
+
+class WorkUnavailableError(RuntimeError):
+    """作品详情明确不可访问，保留现有归档并单独计数。"""
+
+
+UNAVAILABLE_MESSAGES = frozenset((
+    TEMP_MSG["PID_DELETED_TEXT"],
+    TEMP_MSG["PID_ERROR_TEXT"],
+    TEMP_MSG["PID_UNAUTH_ACCESS"],
+    TEMP_MSG["PID_UNAUTH_ACCESS_2"],
+))
 
 
 def list_local_images(dir_path: str, pid: int) -> List[str]:
@@ -70,7 +83,7 @@ def verify_folder(pid: int, path: str, page_count: int, illust_type: int) -> Tup
     return (len(invalid) == 0, invalid)
 
 
-def redownload_one(d: Downloader, table: str, rec: dict) -> bool:
+def redownload_one(d: Downloader, table: str, rec: dict, *, raise_unavailable=False) -> bool:
     """按表与记录重新下载该 PID，下载完成后再次校验。返回最终是否通过。"""
     pid = int(rec.get("pid"))
     illust_type = int(rec.get("illustType", 0))
@@ -90,6 +103,8 @@ def redownload_one(d: Downloader, table: str, rec: dict) -> bool:
     # 走 Downloader 获取信息与下载
     info = d.get_illust_info(pid, extra=("bookmark" if table == "bookmark" else "pixiv"))
     if not info or isinstance(info, str):
+        if raise_unavailable and info in UNAVAILABLE_MESSAGES:
+            raise WorkUnavailableError(str(info))
         logger.warning(f"[checker] 获取作品信息失败或不可访问: {pid} -> {info}")
         return False
 
@@ -102,12 +117,23 @@ def redownload_one(d: Downloader, table: str, rec: dict) -> bool:
 
 def run_startup_check(d: Optional[Downloader] = None):
     d = d or Downloader()
+    summary = {"total": 0, "passed": 0, "repaired": 0, "failed": 0,
+               "unavailable": 0, "skipped": 0, "query_failed": 0}
+    if not hasattr(d.db, "pool"):
+        summary["skipped"] = len(TABLES)
+        logger.info("[checker] 数据库未启用，跳过一致性检查")
+        return summary
     for table in TABLES:
         logger.info(f"[checker] 启动一致性检查 | 表: {table} | 最近 N: {LATEST_LIMIT}")
+        table_start = {key: summary[key] for key in ("total", "passed", "repaired", "failed", "unavailable")}
         try:
+            latest = d.db.select_latest_records(table=table, limit=LATEST_LIMIT, strict=True)
+        except TypeError:
             latest = d.db.select_latest_records(table=table, limit=LATEST_LIMIT)
-        except Exception:
-            latest = []
+        except Exception as exc:
+            summary["query_failed"] += 1
+            logger.warning(f"[checker] table {table} query failed: {exc}")
+            continue
         if not latest:
             logger.info(f"[checker] 表 {table} 无记录可检")
             continue
@@ -123,24 +149,36 @@ def run_startup_check(d: Optional[Downloader] = None):
             page_count = int(rec.get("pageCount", 1))
             illust_type = int(rec.get("illustType", 0))
             total += 1
+            summary["total"] += 1
 
             ok, invalid = verify_folder(pid, path, page_count, illust_type)
             if ok:
                 ok_cnt += 1
+                summary["passed"] += 1
                 continue
 
             logger.warning(f"[checker] 不一致/疑似损坏，准备重下: {table} pid={pid} path={path}")
-            ok2 = redownload_one(d, table, rec)
+            try:
+                ok2 = redownload_one(d, table, rec, raise_unavailable=True)
+            except WorkUnavailableError as exc:
+                summary["unavailable"] += 1
+                logger.warning(f"[checker] 作品不可访问，保留既有归档：{table} pid={pid} -> {exc}")
+                continue
             if not ok2:
                 fail_cnt += 1
+                summary["failed"] += 1
                 logger.warning(f"[checker] 重下失败：{table} pid={pid}")
             else:
                 fix_cnt += 1
+                summary["repaired"] += 1
                 logger.success(f"[checker] 重下完成 | 表:{table} PID:{pid} 再次校验通过")
 
         logger.info(
-            f"[checker] 完成 | 表:{table} 总数:{total} 通过:{ok_cnt} 修复:{fix_cnt} 失败:{fail_cnt}"
+            f"[checker] 完成 | 表:{table} 总数:{total} 通过:{ok_cnt} 修复:{fix_cnt} "
+            f"失败:{fail_cnt} 不可访问:{summary['unavailable'] - table_start['unavailable']}"
         )
+
+    return summary
 
 
 if __name__ == "__main__":

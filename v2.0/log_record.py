@@ -15,6 +15,7 @@ from config import DEBUG
 import threading
 import re
 import atexit
+import datetime
 # 终端模式下各进程都启用跳过日志聚合；重定向到文件/管道时保留完整日志行。
 # 进程间的聚合计数彼此独立，但仍可避免同一抓取进程刷屏。
 _dynamic_console = sys.stderr.isatty()
@@ -37,7 +38,60 @@ _agg_state = {
     "category": None,     # 当前类别标识
 }
 _agg_lock = threading.Lock()
+_context_lock = threading.Lock()
+_log_context = {"batch_id": None, "phase": "preamble", "errors": []}
 _ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def set_log_context(batch_id=None, phase="preamble"):
+    with _context_lock:
+        # 每个阶段独立统计 sink 错误，避免上一阶段的故障污染下一阶段。
+        if batch_id != _log_context.get("batch_id") or phase != _log_context.get("phase"):
+            _log_context["errors"] = []
+        _log_context["batch_id"] = batch_id
+        _log_context["phase"] = phase
+
+
+def get_sink_errors(clear=False):
+    with _context_lock:
+        errors = list(_log_context["errors"])
+        if clear:
+            _log_context["errors"] = []
+        return errors
+
+
+def _record_sink_error(name, exc):
+    with _context_lock:
+        _log_context["errors"].append({
+            "sink": name,
+            "phase": _log_context["phase"],
+            "batch_id": _log_context["batch_id"],
+            "error": repr(exc),
+        })
+
+
+def complete_phase():
+    # 先结束动态聚合行，确保阶段摘要不会与残留的进度行粘连。
+    try:
+        with _agg_lock:
+            _clear_agg_line()
+    except Exception as exc:
+        _record_sink_error("console-finalize", exc)
+    complete = getattr(logger, "complete", None)
+    if complete:
+        try:
+            complete()
+        except Exception as exc:
+            _record_sink_error("logger-complete", exc)
+    # 读取后清零；下一次阶段只报告自己的写入错误。
+    return get_sink_errors(clear=True)
+
+
+def _patch_record(record):
+    """将当前批次/阶段上下文复制到每条 Loguru 记录。"""
+    with _context_lock:
+        record.setdefault("extra", {})["batch_id"] = _log_context.get("batch_id")
+        record.setdefault("extra", {})["phase"] = _log_context.get("phase")
 
 def _visible_len(text: str) -> int:
     try:
@@ -55,7 +109,7 @@ def _erase_line():
             sys.stderr.write("\r")
         sys.stderr.flush()
     except Exception:
-        pass
+        _record_sink_error("console-erase", sys.exc_info()[1])
 
 
 def _is_skip_message(record):
@@ -102,9 +156,12 @@ def _clear_agg_line():
 def _general_console_sink(message: str):
     # 在输出其他日志前，若存在单行聚合状态，则先清除该行
     with _agg_lock:
-        _clear_agg_line()
-        sys.stderr.write(message)
-        sys.stderr.flush()
+        try:
+            _clear_agg_line()
+            sys.stderr.write(message)
+            sys.stderr.flush()
+        except Exception as exc:
+            _record_sink_error("console", exc)
 
 
 def _agg_write(category: str, message: str):
@@ -123,8 +180,12 @@ def _agg_write(category: str, message: str):
             sys.stderr.flush()
             _agg_state["active"] = True
             _agg_state["width"] = _visible_len(text)
-        except Exception:
-            sys.stderr.write(message + "\n")
+        except Exception as exc:
+            _record_sink_error("console-aggregate", exc)
+            try:
+                sys.stderr.write(message + "\n")
+            except Exception:
+                pass
 
 
 def _skip_console_sink(message: str):
@@ -190,24 +251,58 @@ logger.add(
     colorize=True
 )
 
+# patch 必须在所有 sink 注册后安装，保证控制台和异步文件记录携带相同上下文。
+logger = logger.patch(_patch_record)
+
 # 程序结束时，确保清除聚合行，避免残留
 def _agg_finalize():
     try:
         with _agg_lock:
             _clear_agg_line()
     except Exception:
-        pass
+        _record_sink_error("console-finalize", sys.exc_info()[1])
 
 atexit.register(_agg_finalize)
 
-# 日志写入文件（保持原状，包含所有日志）
-logger.add(
-    os.path.join(log_path, "{time}.log"),
-    encoding="utf-8",
-    rotation="00:00",
-    enqueue=True,
-    level=level
-)
+class _FileSink:
+    """可观测的异步文件 sink，避免内建路径 sink 吞掉写入/轮转异常。"""
+    def __init__(self, root):
+        self.root = root
+        self._lock = threading.RLock()
+        self._day = None
+        self._stream = None
+
+    def _ensure_stream(self):
+        day = datetime.datetime.now().strftime("%Y-%m-%d")
+        if self._stream is not None and self._day == day:
+            return
+        if self._stream is not None:
+            self._stream.close()
+        os.makedirs(self.root, exist_ok=True)
+        self._stream = open(os.path.join(self.root, day + ".log"), "a", encoding="utf-8")
+        self._day = day
+
+    def write(self, message):
+        try:
+            with self._lock:
+                self._ensure_stream()
+                self._stream.write(str(message))
+                self._stream.flush()
+        except Exception as exc:
+            _record_sink_error("file", exc)
+
+    def close(self):
+        with self._lock:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                finally:
+                    self._stream = None
+
+
+_file_sink = _FileSink(log_path)
+logger.add(_file_sink.write, enqueue=True, level=level)
+atexit.register(_file_sink.close)
 
 
 # def log_str(*args, end=None):

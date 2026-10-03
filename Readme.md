@@ -95,15 +95,16 @@ python scheduler.py
 
 在 `v2.0/config.py` 中使用 `PIXIV_NOVEL_ENABLED` 开启小说收藏抓取，
 `NOVEL_PATH` 指定独立目录（空字符串使用运行目录下的 `novel`）。
-沿用账号 Cookie、`BOOKMARK_HIDE_ENABLE` 和 `BOOKMARK_CYCLE`。
-运行 `v2.0/scheduler.py` 会启动小说任务；在 `v2.0` 下运行 `python novel.py` 可单次抓取。
+沿用账号 Cookie 和 `BOOKMARK_HIDE_ENABLE`。默认入口是一次性批次：先完成收藏图片阶段，
+排空并输出 `IMAGE_PHASE_DONE` 后才初始化小说阶段；`BOOKMARK_CYCLE` 不再由入口常驻等待，
+请交给外部任务计划器控制周期。在 `v2.0` 下运行 `python novel.py` 可单次抓取。
 
 每部小说保存为 `<NOVEL_PATH>/<小说ID>/<小说ID>.epub`，包含封面、作者上传的内嵌图片、
 引用的 Pixiv 插画（含多图页码），支持离线阅读、章节目录、分页和注音。
 同目录保留 UTF-8 TXT 原文及 `metadata.json` 完整信息。不自动扩展抓取整个系列。
-每轮遍历公开/私密收藏并检查更新，内容相同时不重复写文件；图片下载失败或引用图片不可访问时，
+每批次遍历公开/私密收藏并检查更新，内容相同时不重复写文件；图片下载失败或引用图片不可访问时，
 保留旧 EPUB 并在下轮重试，不将缺图版本记为成功。
-每轮先校验数据库最近 20 部小说的 EPUB 文件并只输出汇总；随后只检查公开、私密收藏最新各 10 部。
+每批次先校验数据库最近 20 部小说的 EPUB 文件并只输出汇总；随后只检查公开、私密收藏最新各 10 部。
 收藏未变化时跳过详情抓取和 EPUB 重建，检测到新收藏后才全量同步收藏列表。
 `SKIP_DB_EXISTS_NOVEL=True` 时，同步列表会跳过数据库已有小说并汇总数量；
 最近 20 部的一致性检查会验证 EPUB 清单、阅读顺序、XML、图片和本地引用，异常时尝试修复。
@@ -116,3 +117,14 @@ python scheduler.py
 其中含历史查询和删除示例）。
 
 接口参考：[PixivBatchDownloader API.ts](https://github.com/xuejianxianzun/PixivBatchDownloader/blob/master/src/ts/API.ts)。
+
+### 批次调度与退出码
+
+推荐使用 Windows 任务计划器启动 `D:\Files\Programs\PixiC\.venv\Scripts\python.exe`，参数为
+`D:\Files\Programs\PixiC\v2.0\scheduler.py`，起始目录设置为 `D:\Files\Programs\PixiC\v2.0`，
+并选择“如果任务已在运行，则不启动新实例”。程序内仍有单实例锁，避免重复批次。
+
+退出码：`0` 表示成功或无变化，`1` 表示抓取、下载、数据库或日志错误，`2` 表示配置/登录/初始化失败，
+`3` 表示已有批次运行，`130` 表示收到 Ctrl+C 或 SIGTERM 协作停止。图片单项失败在日志和摘要中保留，
+只要线程、资源和日志正常收尾，仍会继续小说阶段；阶段屏障或日志排空失败则跳过小说。
+连接交互式终端运行时，小说阶段和批次摘要输出完成后会等待按 Enter 退出；任务计划器或日志重定向运行不会等待。

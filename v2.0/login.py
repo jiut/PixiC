@@ -64,7 +64,7 @@ class Login(object):
 		"""
 		pass
 		
-	def check(self):
+	def check(self, stop_event=None, deadline=None):
 		"""
 		用于在启动多进程前,获取并校验cookie和uid的获取
 		"""
@@ -86,7 +86,7 @@ class Login(object):
 
 		# 检查是否能获取user_id
 		if self.flag:
-			self.user_id = self.get_user_id()
+			self.user_id = self.get_user_id(stop_event=stop_event, deadline=deadline)
 
 		logger.info(TEMP_MSG["INIT_INFO"].format(self.class_name))
 
@@ -154,8 +154,15 @@ class Login(object):
 		# 	self.user_id = USER_ID
 		# return self.cookie
 
-	def get_user_id(self):
-		resp = requests.get(self.host_url,headers=headers,cookies=random.choice(self.cookie_list)).text
+	def get_user_id(self, stop_event=None, deadline=None):
+		if stop_event is not None and stop_event.is_set():
+			raise RuntimeError("登录请求被协作停止")
+		if deadline is not None:
+			import time
+			if time.monotonic() >= deadline:
+				raise TimeoutError("登录请求超过阶段预算")
+		resp = requests.get(self.host_url, headers=headers,
+			cookies=random.choice(self.cookie_list), timeout=(10, 30)).text
 		if "Please turn JavaScript on and reload the page." in resp:
 			logger.warning(TEMP_MSG["GOOGLE_CAPTCHA_ERROR_INFO"].format(self.class_name))
 			exit()

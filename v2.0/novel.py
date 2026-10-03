@@ -16,6 +16,7 @@ from config import (BOOKMARK_HIDE_ENABLE, NOVEL_PATH, NOVEL_UPDATE_CHECK_LIMIT,
 from log_record import logger
 from message import TEMP_MSG
 from novel_epub import build_epub
+from phase_result import PhaseResult
 
 
 class NovelNotFoundError(RuntimeError):
@@ -35,34 +36,37 @@ class Novel:
             downloader.client.user_id)
         self.page_size = 48
 
-    def _bookmark_page(self, rest='show', limit=None):
+    def _bookmark_page(self, rest='show', limit=None, stop_event=None, deadline=None):
         body = self.request(self.bookmark_url, {
-            'tag': '', 'offset': 0, 'limit': limit or self.page_size, 'rest': rest})
+            'tag': '', 'offset': 0, 'limit': limit or self.page_size, 'rest': rest},
+            stop_event=stop_event, deadline=deadline)
         works = body.get('works')
         if not isinstance(works, list):
             raise ValueError('无效小说收藏列表')
         return works
 
-    def check_update(self):
+    def check_update(self, stop_event=None, deadline=None):
         """只比较最新收藏，返回 changed、unchanged 或 error。"""
         if not hasattr(self.db, 'pool'):
             logger.warning('Novel: 未启用数据库，执行全量更新')
             return 'changed'
         try:
-            show = self._bookmark_page('show', NOVEL_UPDATE_CHECK_LIMIT)
+            show = self._bookmark_page('show', NOVEL_UPDATE_CHECK_LIMIT,
+                                       stop_event=stop_event, deadline=deadline)
         except Exception as exc:
             logger.warning('Novel: 检查公开收藏更新失败: {}', exc)
             return 'error'
         hide = []
         if BOOKMARK_HIDE_ENABLE:
             try:
-                hide = self._bookmark_page('hide', NOVEL_UPDATE_CHECK_LIMIT)
+                hide = self._bookmark_page('hide', NOVEL_UPDATE_CHECK_LIMIT,
+                                           stop_event=stop_event, deadline=deadline)
             except Exception as exc:
                 logger.warning('Novel: 检查私密收藏更新失败: {}', exc)
                 return 'error'
         latest = show[:NOVEL_UPDATE_CHECK_LIMIT] + hide[:NOVEL_UPDATE_CHECK_LIMIT]
         if not latest:
-            logger.info('Novel: 公开/私密收藏均为空，暂不更新')
+            logger.warning('Novel: 公开/私密收藏均为空，暂不更新')
             return 'unchanged'
         for work in latest:
             try:
@@ -70,7 +74,10 @@ class Novel:
             except (KeyError, TypeError, ValueError):
                 continue
             try:
-                exists, _ = self.db.check_illust(nid, key='nid', table='novel')
+                try:
+                    exists, _ = self.db.check_illust(nid, key='nid', table='novel', strict=True)
+                except TypeError:
+                    exists, _ = self.db.check_illust(nid, key='nid', table='novel')
             except Exception as exc:
                 logger.warning('Novel: 检查作品 {} 失败: {}', nid, exc)
                 return 'error'
@@ -82,10 +89,10 @@ class Novel:
             if not exists and not unavailable:
                 logger.info('Novel: 检测到新收藏，开始更新')
                 return 'changed'
-        logger.info('Novel: 收藏未变化，暂不更新')
+        logger.warning('Novel: 收藏未变化，暂不更新')
         return 'unchanged'
 
-    def integrity_check(self):
+    def integrity_check(self, stop_event=None, deadline=None):
         """只检查数据库最近20部 EPUB，输出汇总，不逐条输出通过项。"""
         if not hasattr(self.db, 'pool'):
             return {'total': 0, 'passed': 0, 'repaired': 0, 'failed': 0}
@@ -189,9 +196,15 @@ class Novel:
                 return False
             return True
 
-    def request(self, url, params=None):
+    def request(self, url, params=None, stop_event=None, deadline=None):
         # 有限重试：错误响应不能当成空收藏，也不能无限循环。
         for attempt in range(3):
+            event = stop_event or getattr(self, '_stop_event', None)
+            effective_deadline = deadline if deadline is not None else getattr(self, '_deadline', None)
+            if event is not None and event.is_set():
+                raise RuntimeError('小说请求被协作停止')
+            if effective_deadline is not None and time.monotonic() >= effective_deadline:
+                raise RuntimeError('小说请求超过阶段预算')
             try:
                 response = self.downloader.baseRequest({'url': url}, params=params, retry_num=0)
                 if response is None:
@@ -207,7 +220,12 @@ class Novel:
                 if attempt == 2:
                     raise RuntimeError('小说接口请求失败（3 次尝试）: {} - {}'.format(url, exc)) from exc
                 logger.warning('NOVEL_REQUEST_RETRY | 响应/网络错误 | 小说接口重试 {}/3，{} 秒后重试: {} - {}', attempt + 1, 2 ** attempt, url, exc)
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                if event is not None:
+                    if event.wait(delay):
+                        raise RuntimeError('小说重试被协作停止')
+                else:
+                    time.sleep(delay)
 
     def save_novel(self, nid, emit_success=True):
         nid = int(nid)
@@ -257,7 +275,10 @@ class Novel:
 
     def download_image(self, url):
         from novel_epub import image_data
+        event = getattr(self, '_stop_event', None)
         for attempt in range(3):
+            if event is not None and event.is_set():
+                raise RuntimeError('小说图片下载被协作停止')
             try:
                 response = self.downloader.baseRequest({'url': url}, retry_num=0)
                 if response is None:
@@ -268,7 +289,11 @@ class Novel:
                 if attempt == 2:
                     raise RuntimeError('小说图片下载失败（3 次尝试）: {} - {}'.format(url, exc)) from exc
                 logger.warning('NOVEL_IMAGE_RETRY | 图片响应/格式错误 | 小说图片重试 {}/3，{} 秒后重试: {} - {}', attempt + 1, 2 ** attempt, url, exc)
-                time.sleep(2 ** attempt)
+                if event is not None:
+                    if event.wait(2 ** attempt):
+                        raise RuntimeError('小说图片重试被协作停止')
+                else:
+                    time.sleep(2 ** attempt)
 
     @staticmethod
     def atomic_write(path, text):
@@ -285,17 +310,22 @@ class Novel:
                 temporary.unlink()
         return True
 
-    def run(self):
+    def run_once(self, stop_event=None, deadline=None):
+        if stop_event is None:
+            import threading
+            stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._deadline = deadline
         stats = {'success': 0, 'failed': 0, 'page_failed': 0, 'deleted': 0,
                  'skipped_existing': 0, 'aborted': False, 'skipped': False,
                  'check_failed': 0, 'integrity_failed': 0,
                  'integrity_query_failed': 0, 'integrity_deleted': 0}
         logger.info(TEMP_MSG['BEGIN_INFO'].format('Novel'))
         try:
-            self._run(stats)
+            self._run(stats, stop_event=stop_event, deadline=deadline)
         except Exception:
             stats['aborted'] = True
-            logger.opt(exception=True).error('Novel: 本轮异常中断，等待下次轮询')
+            logger.opt(exception=True).error('Novel: 本轮异常中断')
         incomplete = (stats['aborted'] or stats['failed'] or stats['page_failed']
                       or stats.get('check_failed', 0)
                       or stats.get('integrity_failed', 0)
@@ -307,9 +337,31 @@ class Novel:
             stats['page_failed'], stats.get('check_failed', 0),
             stats.get('integrity_failed', 0) + stats.get('integrity_query_failed', 0),
             stats['deleted'] + stats.get('integrity_deleted', 0))
-        return stats
+        result = PhaseResult('novel')
+        result.counts.update(stats)
+        if stop_event.is_set():
+            result.status = 'stopped'
+            result.barrier_passed = False
+            result.reason = '收到协作停止请求'
+        elif stats['aborted']:
+            result.status = 'failed'
+            result.barrier_passed = False
+            result.reason = '小说阶段异常中断'
+        else:
+            result.status = 'completed'
+            result.barrier_passed = True
+            result.cleanup_complete = True
+        if incomplete:
+            result.add_error('小说阶段存在失败项')
+        self._last_stats = stats
+        return result
 
-    def _run(self, stats):
+    def run(self):
+        """Compatibility wrapper retaining the historical statistics return."""
+        self.run_once()
+        return getattr(self, '_last_stats', {})
+
+    def _run(self, stats, stop_event=None, deadline=None):
         if hasattr(self.db, 'pool'):
             try:
                 self.db.ensure_novel_table()
@@ -320,28 +372,37 @@ class Novel:
                 stats['aborted'] = True
                 logger.opt(exception=True).error('小说表初始化失败: {}', exc)
                 return
-        integrity = self.integrity_check()
+        integrity = self.integrity_check(stop_event=stop_event, deadline=deadline)
         stats['integrity_failed'] = integrity.get('failed', 0)
         stats['integrity_query_failed'] = integrity.get('query_failed', 0)
         stats['integrity_deleted'] = integrity.get('deleted', 0)
-        update_state = self.check_update()
+        update_state = self.check_update(stop_event=stop_event, deadline=deadline)
         if update_state in (None, 'error'):
             stats['check_failed'] += 1
             logger.warning('Novel: 更新检查失败，本轮不执行详情抓取，等待下次轮询')
             return
         if update_state in (False, 'unchanged'):
             stats['skipped'] = True
-            logger.info('Novel: 本轮收藏未变化，跳过详情抓取')
+            logger.warning('Novel: 本轮收藏未变化，跳过详情抓取')
             return
         seen = set()
         for rest in self.rest_list:
+            if stop_event is not None and stop_event.is_set():
+                return
             label = {'show': '公开', 'hide': '私密'}.get(rest, rest)
             logger.info('Novel: 开始获取{}收藏', label)
             offset = 0
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    stats['aborted'] = True
+                    logger.warning('Novel: 阶段预算已耗尽')
+                    return
                 try:
                     page = self.request(self.bookmark_url, {
-                        'tag': '', 'offset': offset, 'limit': self.page_size, 'rest': rest})
+                        'tag': '', 'offset': offset, 'limit': self.page_size, 'rest': rest},
+                        stop_event=stop_event, deadline=deadline)
                     works = page['works']
                     if not isinstance(works, list):
                         raise ValueError('无效收藏列表')
@@ -357,6 +418,8 @@ class Novel:
                 if not works:
                     break
                 for work in works:
+                    if stop_event is not None and stop_event.is_set():
+                        return
                     work_id = work.get('id', '未知') if isinstance(work, dict) else '无效条目'
                     try:
                         nid = int(work_id)

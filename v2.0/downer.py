@@ -84,7 +84,7 @@ class Downloader:
 		except Exception:
 			return ""
 
-	def baseRequest(self, options, data=None, params=None, retry_num=5):
+	def baseRequest(self, options, data=None, params=None, retry_num=5, stop_event=None, deadline=None):
 		'''
 	    :params options: 请求参数,暂时只用到headers和url
 	    :params data: Post
@@ -105,12 +105,21 @@ class Downloader:
 		if host:
 			base_headers["Host"] = host
 
+		stop_event = stop_event or getattr(self, "stop_event", None)
+		if stop_event is not None and stop_event.is_set():
+			return None
+		if deadline is not None and time.monotonic() >= deadline:
+			return None
 		try:
 			# 自适应限速：仅对信息类接口生效
 			_url = options.get("url", "")
 			if ADAPTIVE_LIMIT_ENABLED and any(key in _url for key in ["/ajax/", "/touch/ajax/"]):
 				if self._adaptive_delay > 0:
-					time.sleep(self._adaptive_delay)
+					if stop_event is not None:
+						if stop_event.wait(self._adaptive_delay):
+							return None
+					else:
+						time.sleep(self._adaptive_delay)
 			# if options["method"].lower() == "get":
 			# 网络请求函数get、post请求,暂时不判断method字段,待后续更新
 			# logger.debug("cookie_list {}".format(len(self.cookie_list)))
@@ -129,7 +138,13 @@ class Downloader:
 				if response.status_code == 404 and re.fullmatch(r'/ajax/novel/\d+/?', urlsplit(_url).path):
 					return response
 				# 若是信息接口 404，多半为作品被删除/私密，返回可解析的错误 JSON，避免误判为网络失败
-				if response.status_code == 404 and any(key in _url for key in ["/ajax/illust/", "/touch/ajax/illust/details"]):
+				_detail_404 = (
+					response.status_code == 404 and (
+						re.fullmatch(r'/ajax/illust/\d+/?', urlsplit(_url).path)
+						or re.fullmatch(r'/touch/ajax/illust/details/?', urlsplit(_url).path)
+					)
+				)
+				if _detail_404:
 					class _FakeResponse:
 						pass
 					fake = _FakeResponse()
@@ -143,8 +158,13 @@ class Downloader:
 		except  Exception as e:
 			if retry_num > 0:
 				logger.warning(TEMP_MSG["DM_RETRY_INFO"].format(options["url"]))
-				time.sleep(1)
-				return self.baseRequest(options,data,params,retry_num-1)
+				if stop_event is not None:
+					if stop_event.wait(1):
+						return None
+				else:
+					time.sleep(1)
+				return self.baseRequest(options, data, params, retry_num-1,
+									 stop_event=stop_event, deadline=deadline)
 			else:
 				logger.warning(TEMP_MSG["DM_NETWORK_ERROR_INFO"].format(self.class_name,options,e))
 				return None
@@ -178,12 +198,12 @@ class Downloader:
 			return None
 
 		# 未登录
-		if resp["message"] == TEMP_MSG["UNLOGIN_TEXT"]:
+		if resp.get("message") == TEMP_MSG["UNLOGIN_TEXT"]:
 			logger.warning(TEMP_MSG["UNLOGIN_INFO"].format(self.class_name))
 			return None
 
 		# 出错则不更新不下载;
-		if resp["error"] == True:
+		if resp.get("error") is True:
 			# 判断其他状态
 			# 作品被删除--该作品已被删除，或作品ID不存在。
 			if resp["message"] == TEMP_MSG["PID_DELETED_TEXT"]:
@@ -208,11 +228,17 @@ class Downloader:
 			# 兜底：常见 404/错误页的“无法找到您所请求的页面”
 			elif TEMP_MSG["PID_ERROR_TEXT"] in str(resp.get("message", "")):
 				return TEMP_MSG["PID_ERROR_TEXT"]
+			else:
+				logger.warning("作品详情接口返回未识别错误 - {} - {}".format(pid, resp.get("message", "")))
+				return None
 
 		# 作品数据
 		# 请求成功：衰减自适应延迟
 		self._adaptive_delay *= self._adaptive_decay_ratio
-		info = resp["body"]
+		info = resp.get("body")
+		if not isinstance(info, dict):
+			logger.warning("作品详情响应缺少有效 body - {}".format(pid))
+			return None
 		# uid
 		uid = int(info["author_details"]["user_id"])
 		# userName
@@ -308,7 +334,8 @@ class Downloader:
 			data["path"] = path
 			# 下载器启动
 			logger.info("id:{} 作品正在下载".format(pid))
-			self.filter(data)
+			if not self.filter(data):
+				return None
 		else:
 			path = "None"
 			data["path"] = path
@@ -333,11 +360,11 @@ class Downloader:
 
 		if pageCount == 1:
 			if illustType == 2:
-				self.illustGif(data)
+				return self.illustGif(data)
 			else:
-				self.illustSingle(data)
+				return self.illustSingle(data)
 		else:
-			self.illustMulti(data)
+			return self.illustMulti(data)
 
 	def illustSingle(self, data):
 		"""
@@ -353,7 +380,7 @@ class Downloader:
 		if os.path.exists(illustPath) == True and os.path.getsize(illustPath) > 1000 and IsValidImage(illustPath):
 			# 作品存在且大于1000字节,为了避免58字节错误页面和其他错误页面
 			# logger.info("{}已存在".format(name))
-			pass
+			return True
 		else:
 			c = self.baseRequest(options={"url":original})
 			if c == None:
@@ -362,6 +389,7 @@ class Downloader:
 			logger.success(TEMP_MSG["DM_DOWNLOAD_SUCCESS_INFO"].format(self.class_name,name,self.size2Mb(size)))
 			if DOWNLOAD_POST_DELAY_SECONDS > 0:
 				time.sleep(DOWNLOAD_POST_DELAY_SECONDS)
+			return True
 
 	def illustMulti(self, data):
 		"""
@@ -374,14 +402,20 @@ class Downloader:
 		if multi_resp == None:
 			return None
 
-		multi_json = json.loads(multi_resp.text)
-		if multi_json["error"] == True or multi_json["body"] == []:
+		try:
+			multi_json = json.loads(multi_resp.text)
+		except (TypeError, json.JSONDecodeError):
+			logger.warning("多图页面响应无法解析 - {}".format(data["pid"]))
+			return None
+		if multi_json.get("error") is True or not isinstance(multi_json.get("body"), list) or not multi_json["body"]:
 			logger.info(TEMP_MSG["ILLUST_EMPTY_INFO"].format(self.class_name,data["pid"]))
 			return None
 		
 		for m in multi_json["body"]:
 			# https://i.pixiv.cat/img-original/img/2020/01/20/04/13/16/78997178_p0.png
-			new_original = m["urls"].get("original","")
+			new_original = m.get("urls", {}).get("original","") if isinstance(m, dict) else ""
+			if not new_original:
+				return None
 			# 78997178-0.png
 			name = new_original.split("/")[-1].replace("_p","-")
 			illustPath = os.path.join(path_,name)
@@ -396,6 +430,7 @@ class Downloader:
 				logger.success(TEMP_MSG["DM_DOWNLOAD_SUCCESS_INFO"].format(self.class_name,name,self.size2Mb(size)))
 				if DOWNLOAD_POST_DELAY_SECONDS > 0:
 					time.sleep(DOWNLOAD_POST_DELAY_SECONDS)
+		return True
 
 	def illustGif(self, data):
 		"""
@@ -415,14 +450,21 @@ class Downloader:
 
 		if os.path.exists(illustPath) == True and os.path.getsize(illustPath) > 1000:
 			# logger.debug("{}已存在".format(name))
-			pass
+			return True
 		else:
 			z_info = self.baseRequest(options={"url":zipInfoUrl})
 			if z_info == None:
 				return None
 
-			z = json.loads(z_info.text)
-			zip_url = z["body"]["originalSrc"]
+			try:
+				z = json.loads(z_info.text)
+			except (TypeError, json.JSONDecodeError):
+				return None
+			if z.get("error") is True or not isinstance(z.get("body"), dict):
+				return None
+			zip_url = z["body"].get("originalSrc")
+			if not zip_url:
+				return None
 			# item["delay"]为对应图片停留间隔,单位毫秒
 			delay = [item["delay"]/1000 for item in z["body"]["frames"]]
 
@@ -455,6 +497,7 @@ class Downloader:
 			for j in files:
 				os.remove(os.path.join(path_,j))
 			time.sleep(1)
+			return True
 
 	def downSomething(self, path, content):
 		"""
