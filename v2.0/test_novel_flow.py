@@ -34,7 +34,17 @@ class NovelFlowTests(unittest.TestCase):
         self.assertTrue(stats['skipped'])
         novel.save_novel.assert_not_called()
         self.assertEqual(novel.request.call_count, 1)
-        db.check_illust.assert_called_once_with(10, key='nid', table='novel')
+        db.check_illust.assert_called_once_with(10, key='nid', table='novel', strict=True)
+
+    def test_unchanged_bookmarks_use_warning_level(self):
+        novel, _ = self.make()
+        novel.rest_list = ['show']
+        novel.request = Mock(return_value={'works': [{'id': '10'}], 'total': 1})
+        with patch('novel.BOOKMARK_HIDE_ENABLE', False), \
+             patch('novel.logger') as log:
+            self.assertEqual(novel.check_update(), 'unchanged')
+        log.warning.assert_called_once_with('Novel: 收藏未变化，暂不更新')
+        log.info.assert_not_called()
 
     def test_new_bookmark_starts_full_pagination(self):
         novel, db = self.make()

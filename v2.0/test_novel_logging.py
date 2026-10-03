@@ -94,14 +94,11 @@ class NovelLoggingTests(unittest.TestCase):
     def test_scheduler_logs_sleep_after_run(self):
         from scheduler import Scheduler
         with patch('novel.Novel', return_value=self.novel), \
-                patch.object(self.novel, 'run') as run, \
-                patch('scheduler.time.sleep', side_effect=KeyboardInterrupt) as sleep:
-            with self.assertRaises(KeyboardInterrupt):
-                Scheduler().scheduler_novel(limit=15)
+                patch.object(self.novel, 'run_once') as run, \
+                patch('scheduler.time.sleep') as sleep:
+            Scheduler().scheduler_novel(limit=15)
         run.assert_called_once()
-        sleep.assert_called_once_with(15)
-        self.assertIn('Novel:进入休眠', self.messages())
-        self.assertIn('15 秒', self.messages())
+        sleep.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 def console_worker(kind):
@@ -16,6 +16,35 @@ def console_worker(kind):
 
 
 class LogIntegrationTests(unittest.TestCase):
+    def test_log_context_is_attached_to_records(self):
+        import log_record
+        log_record.set_log_context("batch-test", "images")
+        record = {"extra": {}}
+        log_record._patch_record(record)
+        self.assertEqual(record["extra"]["batch_id"], "batch-test")
+        self.assertEqual(record["extra"]["phase"], "images")
+        log_record.set_log_context(None, "preamble")
+
+    def test_file_sink_failure_is_reported_at_phase_boundary(self):
+        import log_record
+        sink = log_record._FileSink(str(Path(__file__).resolve().parent / "__missing_log_test__"))
+        log_record.set_log_context("batch-test", "images")
+        with patch.object(sink, "_ensure_stream", side_effect=OSError("disk full")):
+            sink.write("x")
+        errors = log_record.get_sink_errors(clear=True)
+        self.assertTrue(errors)
+        self.assertEqual(errors[0]["sink"], "file")
+        sink.close()
+        log_record.set_log_context(None, "preamble")
+
+    def test_complete_phase_drains_and_clears_sink_errors(self):
+        import log_record
+        log_record.set_log_context("batch-test", "images")
+        log_record._record_sink_error("test", RuntimeError("late callback"))
+        self.assertEqual(len(log_record.complete_phase()), 1)
+        self.assertEqual(log_record.get_sink_errors(), [])
+        log_record.set_log_context(None, "preamble")
+
     def test_spawned_console_logs_have_separate_lines(self):
         result = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--probe'],
                                 capture_output=True, timeout=30)
